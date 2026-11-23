@@ -1,0 +1,11 @@
+import "lib"
+fn main() {
+    var c = lib.Ctx.new("POST", "/webhooks/github", "", Vec.new())
+    if c.method() != "POST" || c.path() != "/webhooks/github" { panic("missing context accessors") }
+    c.add_req_header("X-Hub-Signature-256", "sha256=expected")
+    match c.header("x-hub-signature-256") {
+        Some(value) => { if value != "sha256=expected" { panic("wrong header") } }
+        None => { panic("case-insensitive header lookup failed") }
+    }
+    print("Flame context accessors and case-insensitive headers passed")
+}

@@ -1,0 +1,32 @@
+import "lib"
+import "testing"
+fn test_context_accessors_and_case_insensitive_headers(t &mut testing.T) {
+    var c=lib.Ctx.new("POST","/webhooks/github","",Vec.new())
+    t.eq(c.method().clone(),"POST")
+    t.eq(c.path().clone(),"/webhooks/github")
+    c.add_req_header("X-Hub-Signature-256","sha256=expected")
+    t.eq(c.header("x-hub-signature-256").unwrap_or(""),"sha256=expected")
+}
+fn test_percent_decoding_is_once_and_keeps_path_plus(t &mut testing.T) {
+    t.eq(lib.decode_component("%40tarn-lng",false).unwrap_or(""),"@tarn-lng")
+    t.eq(lib.decode_component("hello+world%2B",true).unwrap_or(""),"hello world+")
+    t.eq(lib.decode_component("a+b",false).unwrap_or(""),"a+b")
+    t.eq(lib.decode_component("%2540",false).unwrap_or(""),"%40")
+    t.eq(lib.decode_component("caf%C3%A9",false).unwrap_or(""),"café")
+    t.eq(lib.decode_component("a%2Fb",false).unwrap_or(""),"a/b")
+}
+fn test_percent_decoder_rejects_malformed_utf8_escape_and_nul(t &mut testing.T) {
+    t.none(&lib.decode_component("%",false))
+    t.none(&lib.decode_component("%4",false))
+    t.none(&lib.decode_component("%G0",false))
+    t.none(&lib.decode_component("%FF",false))
+    t.none(&lib.decode_component("%00",false))
+}
+
+import "json"
+fn test_error_messages_are_valid_json_with_quotes_and_unicode(t &mut testing.T) {
+    message:="quote \" and backslash \\ and newline\n café"
+    error:=lib.Error.new(400,message.clone())
+    parsed:=json.parse(&error.to_json()).unwrap()
+    t.eq(parsed.text("error").unwrap_or(""),message)
+}

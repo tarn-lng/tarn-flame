@@ -3,6 +3,7 @@
 import "http"
 import "io"
 import "string"
+import "json"
 
 /// High-level HTTP error representation with status code and human-readable message.
 pub struct Error {
@@ -20,6 +21,16 @@ pub fn Error.forbidden(message string) Error { return Error.new(403, message) }
 pub fn Error.not_found(message string) Error { return Error.new(404, message) }
 pub fn Error.conflict(message string) Error { return Error.new(409, message) }
 pub fn Error.internal(message string) Error { return Error.new(500, message) }
+
+/// Encode errors as JSON with the standard writer, including untrusted quotes,
+/// backslashes, control characters and Unicode. Never interpolate JSON text.
+pub fn Error.to_json(&self) string {
+    var out=json.Writer.new()
+    out.begin_object()
+    out.field_string("error",&self.message)
+    out.end_object()
+    return out.finish()
+}
 
 /// Route parameter or query string key-value pair.
 pub struct Param {
@@ -69,6 +80,11 @@ pub fn Ctx.new(method string, path string, query_str string, req_body Vec<u8>) C
     }
 }
 
+/// Request method and path. These accessors intentionally share the public
+/// field names; Tarn selects a method call when a field is not callable.
+pub fn Ctx.method(&self) &string { return &self.method }
+pub fn Ctx.path(&self) &string { return &self.path }
+
 pub fn Ctx.add_req_header(&mut self, name string, val string) {
     self.req_headers.push(Header{name: name, val: val})
 }
@@ -76,7 +92,7 @@ pub fn Ctx.add_req_header(&mut self, name string, val string) {
 /// Return request header value by case-insensitive name if present.
 pub fn Ctx.header(&self, name &string) Option<string> {
     for h in self.req_headers.as_slice() {
-        if &h.name == name {
+        if string.equal_ascii_case_insensitive(&h.name, name) {
             return Some(h.val.clone())
         }
     }
@@ -138,11 +154,11 @@ pub fn Ctx.text(&mut self, status u16, text &string) Result<void, Error> {
 }
 
 /// Send JSON response with content-type `application/json`.
-pub fn Ctx.json(&mut self, status u16, json string) Result<void, Error> {
+pub fn Ctx.json(&mut self, status u16, payload string) Result<void, Error> {
     self.resp_status = status
     self.set_header("content-type", "application/json")
     self.resp_body = Vec.new()
-    for b in json.bytes() {
+    for b in payload.bytes() {
         self.resp_body.push(b)
     }
     return Ok(())
@@ -323,6 +339,48 @@ fn parse_target(target &string) Target {
         }
     }
     return Target{path: path, query: query}
+}
+
+fn hex_digit(byte u8) Option<u8> {
+    if byte>=48 && byte<=57 {return Some(byte-48)}
+    if byte>=65 && byte<=70 {return Some(byte-55)}
+    if byte>=97 && byte<=102 {return Some(byte-87)}
+    return None
+}
+/// Decode exactly one URI component. Query form encoding treats + as space;
+/// path components preserve a literal +. Raw paths are matched before decoding,
+/// so an encoded slash never changes route segmentation. Invalid UTF-8,
+/// malformed escapes and NUL fail closed instead of being silently accepted.
+pub fn decode_component(value &string,form bool) Option<string> {
+    var bytes:Vec<u8> = Vec.new()
+    var at=usize(0)
+    for at<value.len() {
+        var byte=value.bytes()[at]
+        if byte==37 {
+            if at+2>=value.len() {return None}
+            var high=u8(0)
+            var low=u8(0)
+            match hex_digit(value.bytes()[at+1]) {Some(n)=>{high=n}
+                None=>{return None}}
+            match hex_digit(value.bytes()[at+2]) {Some(n)=>{low=n}
+                None=>{return None}}
+            byte=high*16+low
+            at=at+2
+        } else {if form && byte==43 {byte=32}}
+        if byte==0 {return None}
+        bytes.push(byte)
+        at=at+1
+    }
+    return string.from_utf8(bytes.as_slice())
+}
+fn decode_params(values &mut Vec<Param>,form bool) bool {
+    for item in values.as_mut_slice() {
+        match decode_component(&item.key,form) {Some(key)=>{item.key=key}
+            None=>{return false}}
+        match decode_component(&item.val,form) {Some(value)=>{item.val=value}
+            None=>{return false}}
+    }
+    return true
 }
 
 fn parse_query_params(query &string, out_params &mut Vec<Param>) {
@@ -524,6 +582,9 @@ pub fn App.handle(&self, req &http.Request) Result<http.Response, http.Error> {
         }
     }
     parse_query_params(&ctx.query_str, &mut ctx.query_params)
+    if !decode_params(&mut ctx.query_params,true) {
+        return http.Response.json(400,"{\"error\":\"Malformed query encoding\"}")
+    }
 
     // Run global middlewares
     for mw in self.middlewares.as_slice() {
@@ -540,6 +601,9 @@ pub fn App.handle(&self, req &http.Request) Result<http.Response, http.Error> {
         if match_route(&r.pattern, &ctx.path, &mut params) {
             method_match = true
             if r.method == ctx.method {
+                if !decode_params(&mut params,false) {
+                    return http.Response.json(400,"{\"error\":\"Malformed path parameter encoding\"}")
+                }
                 ctx.params = params
                 match (r.handler)(&mut ctx) {
                     Ok(v) => {}
@@ -547,7 +611,7 @@ pub fn App.handle(&self, req &http.Request) Result<http.Response, http.Error> {
                         ctx.status(e.status)
                         ctx.set_header("content-type", "application/json")
                         ctx.resp_body = Vec.new()
-                        err_json := "{\"error\": \"" + e.message + "\"}"
+                        err_json := e.to_json()
                         for b in err_json.bytes() {
                             ctx.resp_body.push(b)
                         }
